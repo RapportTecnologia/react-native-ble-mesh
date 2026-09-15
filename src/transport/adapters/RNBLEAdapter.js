@@ -1,3 +1,4 @@
+// @ts-nocheck
 'use strict';
 
 /**
@@ -82,6 +83,20 @@ class RNBLEAdapter extends BLEAdapter {
      * @private
      */
     this._disconnectCallback = null;
+
+    /**
+     * Whether the peripheral GATT server is active
+     * @type {boolean}
+     * @private
+     */
+    this._peripheralStarted = false;
+
+    /**
+     * Peripheral event subscription handles
+     * @type {any[]}
+     * @private
+     */
+    this._peripheralSubscriptions = [];
   }
 
   /**
@@ -154,9 +169,30 @@ class RNBLEAdapter extends BLEAdapter {
       this._stateSubscription = null;
     }
 
+    // Stop peripheral and remove peripheral subscriptions
+    if (this._peripheralStarted) {
+      await this.stopPeripheral();
+    }
+    for (const sub of this._peripheralSubscriptions) {
+      if (sub && typeof sub.remove === 'function') {
+        sub.remove();
+      }
+    }
+    this._peripheralSubscriptions = [];
+
     // Disconnect all devices
     for (const deviceId of this._devices.keys()) {
       await this.disconnect(deviceId);
+    }
+
+    // Disconnect all connected centrals
+    try {
+      const peripherals = await this.connectedPeripherals();
+      for (const device of peripherals) {
+        await this.cancelPeripheralConnection(device.id);
+      }
+    } catch (error) {
+      // ignore cleanup errors
     }
 
     // Destroy manager
@@ -166,6 +202,7 @@ class RNBLEAdapter extends BLEAdapter {
     }
 
     this._initialized = false;
+    this._peripheralStarted = false;
   }
 
   /**
@@ -340,6 +377,203 @@ class RNBLEAdapter extends BLEAdapter {
    */
   onDeviceDisconnected(callback) {
     this._disconnectCallback = callback;
+  }
+
+  /**
+   * Requests an MTU update for a connected device
+   * @param {string} deviceId - Target device ID
+   * @param {number} mtu - Desired MTU
+   * @returns {Promise<number>} Negotiated MTU
+   */
+  async requestMTU(deviceId, mtu) {
+    this._ensureInitialized();
+    const device = this._devices.get(deviceId);
+    if (device && typeof device.requestMTU === 'function') {
+      const updated = await device.requestMTU(mtu);
+      return updated.mtu || mtu;
+    }
+    if (typeof this._manager.requestMTUForDevice === 'function') {
+      const updated = await this._manager.requestMTUForDevice(deviceId, mtu);
+      return updated.mtu || mtu;
+    }
+    return mtu;
+  }
+
+  // --------------------------------------------------------------------------
+  // Peripheral mode (GATT server + advertiser)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Starts the BLE peripheral (advertising + GATT server)
+   * @param {Object} config - Peripheral configuration
+   * @param {string} config.serviceUuid - Service UUID to advertise
+   * @param {string} config.txCharUuid - TX (write) characteristic UUID
+   * @param {string} config.rxCharUuid - RX (notify) characteristic UUID
+   * @param {string} [config.advertiseMode] - Advertising power mode
+   * @param {string|null} [config.deviceName] - Local device name
+   * @returns {Promise<void>}
+   */
+  async startPeripheral(config) {
+    this._ensureInitialized();
+    if (typeof this._manager.startPeripheral !== 'function') {
+      throw new Error('BleManager does not support peripheral mode');
+    }
+    await this._manager.startPeripheral(config);
+    this._peripheralStarted = true;
+  }
+
+  /**
+   * Stops the BLE peripheral
+   * @returns {Promise<void>}
+   */
+  async stopPeripheral() {
+    if (this._manager && this._peripheralStarted && typeof this._manager.stopPeripheral === 'function') {
+      try {
+        await this._manager.stopPeripheral();
+      } catch (error) {
+        // ignore cleanup errors
+      }
+    }
+    this._peripheralStarted = false;
+  }
+
+  /**
+   * Sends a notification to a connected central on a peripheral characteristic
+   * @param {string} deviceId - Central device ID
+   * @param {string} serviceUUID - Service UUID
+   * @param {string} charUUID - Characteristic UUID
+   * @param {Uint8Array} data - Data to notify
+   * @returns {Promise<void>}
+   */
+  async notifyPeripheralCharacteristic(deviceId, serviceUUID, charUUID, data) {
+    this._ensureInitialized();
+    if (typeof this._manager.notifyPeripheralCharacteristic !== 'function') {
+      throw new Error('BleManager does not support peripheral notifications');
+    }
+    const valueBase64 = this._uint8ArrayToBase64(data);
+    await this._manager.notifyPeripheralCharacteristic(deviceId, serviceUUID, charUUID, valueBase64);
+  }
+
+  /**
+   * Cancels a peripheral-side connection to a central
+   * @param {string} deviceId - Central device ID
+   * @returns {Promise<void>}
+   */
+  async cancelPeripheralConnection(deviceId) {
+    if (this._manager && typeof this._manager.cancelPeripheralConnection === 'function') {
+      await this._manager.cancelPeripheralConnection(deviceId);
+    }
+  }
+
+  /**
+   * Lists centrals currently connected to the peripheral GATT server
+   * @returns {Promise<Array<{id: string, name: string|null, rssi: number|null}>>}
+   */
+  async connectedPeripherals() {
+    this._ensureInitialized();
+    if (typeof this._manager.connectedPeripherals !== 'function') {
+      return [];
+    }
+    const devices = await this._manager.connectedPeripherals();
+    return devices.map((device) => ({
+      id: device.id,
+      name: device.name || device.localName || null,
+      rssi: device.rssi
+    }));
+  }
+
+  /**
+   * Gets the MTU negotiated with a connected central
+   * @param {string} deviceId - Central device ID
+   * @returns {Promise<number>}
+   */
+  async peripheralMTU(deviceId) {
+    this._ensureInitialized();
+    if (typeof this._manager.peripheralMTU !== 'function') {
+      return 23;
+    }
+    return this._manager.peripheralMTU(deviceId);
+  }
+
+  /**
+   * Registers a callback for a central connecting to the peripheral GATT server
+   * @param {Function} callback - Callback function receiving deviceId
+   */
+  onPeripheralCentralConnected(callback) {
+    if (this._manager && typeof this._manager.onPeripheralCentralConnected === 'function') {
+      const sub = this._manager.onPeripheralCentralConnected((deviceId) => callback(deviceId));
+      if (sub && typeof sub.remove === 'function') {
+        this._peripheralSubscriptions.push(sub);
+      }
+    }
+  }
+
+  /**
+   * Registers a callback for a central disconnecting from the peripheral GATT server
+   * @param {Function} callback - Callback function receiving deviceId
+   */
+  onPeripheralCentralDisconnected(callback) {
+    if (this._manager && typeof this._manager.onPeripheralCentralDisconnected === 'function') {
+      const sub = this._manager.onPeripheralCentralDisconnected((deviceId) => callback(deviceId));
+      if (sub && typeof sub.remove === 'function') {
+        this._peripheralSubscriptions.push(sub);
+      }
+    }
+  }
+
+  /**
+   * Registers a callback for writes from a connected central on the peripheral TX characteristic
+   * @param {Function} callback - Callback function receiving {deviceId, data}
+   */
+  onPeripheralWrite(callback) {
+    if (this._manager && typeof this._manager.onPeripheralWrite === 'function') {
+      const sub = this._manager.onPeripheralWrite((event) => {
+        const data = this._base64ToUint8Array(event.value);
+        callback({ deviceId: event.deviceId, data });
+      });
+      if (sub && typeof sub.remove === 'function') {
+        this._peripheralSubscriptions.push(sub);
+      }
+    }
+  }
+
+  /**
+   * Registers a callback for MTU changes on a peripheral connection
+   * @param {Function} callback - Callback function receiving {deviceId, mtu}
+   */
+  onPeripheralMtuChanged(callback) {
+    if (this._manager && typeof this._manager.onPeripheralMtuChanged === 'function') {
+      const sub = this._manager.onPeripheralMtuChanged((event) => callback(event));
+      if (sub && typeof sub.remove === 'function') {
+        this._peripheralSubscriptions.push(sub);
+      }
+    }
+  }
+
+  /**
+   * Registers a callback for subscription changes from a connected central
+   * @param {Function} callback - Callback function receiving {deviceId, serviceUUID, characteristicUUID, subscribed}
+   */
+  onPeripheralSubscriptionChanged(callback) {
+    if (this._manager && typeof this._manager.onPeripheralSubscriptionChanged === 'function') {
+      const sub = this._manager.onPeripheralSubscriptionChanged((event) => callback(event));
+      if (sub && typeof sub.remove === 'function') {
+        this._peripheralSubscriptions.push(sub);
+      }
+    }
+  }
+
+  /**
+   * Registers a callback for peripheral server errors
+   * @param {Function} callback - Callback function receiving {message}
+   */
+  onPeripheralError(callback) {
+    if (this._manager && typeof this._manager.onPeripheralError === 'function') {
+      const sub = this._manager.onPeripheralError((event) => callback(event));
+      if (sub && typeof sub.remove === 'function') {
+        this._peripheralSubscriptions.push(sub);
+      }
+    }
   }
 
   /**

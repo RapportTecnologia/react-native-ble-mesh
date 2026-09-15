@@ -691,6 +691,7 @@ export interface BLETransportOptions {
   adapter?: BLEAdapter;
   powerMode?: keyof typeof POWER_MODE;
   autoConnect?: boolean;
+  peripheral?: boolean;
 }
 
 /**
@@ -784,9 +785,22 @@ export interface BLEAdapter {
   stop(): Promise<void>;
   scan(options: unknown): Promise<void>;
   stopScan(): Promise<void>;
-  connect(deviceId: string): Promise<void>;
+  connect(deviceId: string): Promise<{ id: string; name: string | null; rssi: number | null }>;
   disconnect(deviceId: string): Promise<void>;
   write(deviceId: string, data: Uint8Array): Promise<void>;
+  requestMTU(deviceId: string, mtu: number): Promise<number>;
+  startPeripheral(config: { serviceUuid: string; txCharUuid: string; rxCharUuid: string; advertiseMode?: string; deviceName?: string | null }): Promise<void>;
+  stopPeripheral(): Promise<void>;
+  notifyPeripheralCharacteristic(deviceId: string, serviceUUID: string, charUUID: string, data: Uint8Array): Promise<void>;
+  cancelPeripheralConnection(deviceId: string): Promise<void>;
+  connectedPeripherals(): Promise<Array<{ id: string; name: string | null; rssi: number | null }>>;
+  peripheralMTU(deviceId: string): Promise<number>;
+  onPeripheralCentralConnected(listener: (deviceId: string) => void): void;
+  onPeripheralCentralDisconnected(listener: (deviceId: string) => void): void;
+  onPeripheralWrite(listener: (event: { deviceId: string; data: Uint8Array }) => void): void;
+  onPeripheralMtuChanged(listener: (event: { deviceId: string; mtu: number }) => void): void;
+  onPeripheralSubscriptionChanged(listener: (event: { deviceId: string; serviceUUID: string; characteristicUUID: string; subscribed: boolean }) => void): void;
+  onPeripheralError(listener: (event: { message: string }) => void): void;
 }
 
 export namespace crypto {

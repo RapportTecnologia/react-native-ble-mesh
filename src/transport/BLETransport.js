@@ -31,6 +31,8 @@ class BLETransport extends Transport {
    * @param {number} [options.maxPeers=8] - Maximum peers
    * @param {number} [options.connectTimeoutMs=10000] - Connection timeout
    * @param {number} [options.mtu=23] - Default BLE MTU
+   * @param {boolean} [options.autoConnect=true] - Auto-connect to discovered devices
+   * @param {boolean} [options.peripheral=true] - Start BLE peripheral (advertising + GATT server)
    */
   constructor(adapter, options = {}) {
     super(options);
@@ -90,6 +92,34 @@ class BLETransport extends Transport {
     this._writing = new Map();
 
     /**
+     * Whether to auto-connect to discovered devices
+     * @type {boolean}
+     * @private
+     */
+    this._autoConnect = options.autoConnect !== false;
+
+    /**
+     * Whether to start the BLE peripheral (advertiser + GATT server)
+     * @type {boolean}
+     * @private
+     */
+    this._enablePeripheral = options.peripheral !== false;
+
+    /**
+     * Peripheral power profile
+     * @type {any}
+     * @private
+     */
+    this._peripheralPower = this._powerMode;
+
+    /**
+     * Device IDs with an in-progress central connection
+     * @type {Set<string>}
+     * @private
+     */
+    this._pendingConnections = new Set();
+
+    /**
      * Bound event handlers for cleanup
      * @type {any}
      * @private
@@ -97,8 +127,20 @@ class BLETransport extends Transport {
     this._handlers = {
       onStateChange: this._handleStateChange.bind(this),
       onDeviceDiscovered: this._handleDeviceDiscovered.bind(this),
-      onDeviceDisconnected: this._handleDeviceDisconnected.bind(this)
+      onDeviceDisconnected: this._handleDeviceDisconnected.bind(this),
+      onPeripheralCentralConnected: this._handlePeripheralCentralConnected.bind(this),
+      onPeripheralCentralDisconnected: this._handlePeripheralCentralDisconnected.bind(this),
+      onPeripheralWrite: this._handlePeripheralWrite.bind(this),
+      onPeripheralMtuChanged: this._handlePeripheralMtuChanged.bind(this),
+      onPeripheralError: this._handlePeripheralError.bind(this)
     };
+
+    /**
+     * Active peripheral event subscriptions
+     * @type {any[]}
+     * @private
+     */
+    this._peripheralSubscriptions = [];
   }
 
   /**
@@ -146,6 +188,14 @@ class BLETransport extends Transport {
         });
       }
 
+      // Register peripheral event listeners
+      this._registerPeripheralListeners();
+
+      // Start BLE peripheral (advertising + GATT server)
+      if (this._enablePeripheral) {
+        await this._startPeripheral();
+      }
+
       this._setState(Transport.STATE.RUNNING);
 
       // Auto-start scanning for peers
@@ -178,6 +228,16 @@ class BLETransport extends Transport {
         disconnectPromises.push(this.disconnectFromPeer(peerId));
       }
       await Promise.all(disconnectPromises);
+
+      // Stop peripheral and remove listeners
+      this._unregisterPeripheralListeners();
+      if (this._adapter && typeof this._adapter.stopPeripheral === 'function') {
+        try {
+          await this._adapter.stopPeripheral();
+        } catch (/** @type {any} */ error) {
+          // ignore cleanup errors
+        }
+      }
 
       await this._adapter.destroy();
     } finally {
@@ -235,10 +295,14 @@ class BLETransport extends Transport {
     try {
       /** @type {any} */ let timeoutId;
       const timeoutPromise = new Promise((_, reject) => {
+        // @ts-ignore setTimeout is provided by the JS runtime; @types/node is not installed here
         timeoutId = setTimeout(() => reject(new Error('Connection timeout')), this._connectTimeoutMs);
       });
       const device = await Promise.race([
-        this._adapter.connect(peerId).then((/** @type {any} */ d) => { clearTimeout(timeoutId); return d; }),
+        this._adapter.connect(peerId).then((/** @type {any} */ d) => {
+          // @ts-ignore clearTimeout is provided by the JS runtime; @types/node is not installed here
+          clearTimeout(timeoutId); return d;
+        }),
         timeoutPromise
       ]);
 
@@ -265,14 +329,17 @@ class BLETransport extends Transport {
 
       const connectionInfo = {
         peerId,
+        role: 'central',
         device,
         connectedAt: Date.now(),
         mtu: negotiatedMtu
       };
 
+      this._pendingConnections.delete(peerId);
       this._peers.set(peerId, connectionInfo);
       this.emit('peerConnected', { peerId, rssi: device.rssi || -50 });
     } catch (/** @type {any} */ error) {
+      this._pendingConnections.delete(peerId);
       if (error.message === 'Connection timeout') {
         throw ConnectionError.connectionTimeout(peerId);
       }
@@ -290,8 +357,16 @@ class BLETransport extends Transport {
       return;
     }
 
+    const peerInfo = this._peers.get(peerId);
+
     try {
-      await this._adapter.disconnect(peerId);
+      if (peerInfo && peerInfo.role === 'peripheral') {
+        if (typeof this._adapter.cancelPeripheralConnection === 'function') {
+          await this._adapter.cancelPeripheralConnection(peerId);
+        }
+      } else {
+        await this._adapter.disconnect(peerId);
+      }
     } finally {
       this._peers.delete(peerId);
 
@@ -328,14 +403,34 @@ class BLETransport extends Transport {
     const chunkSize = Math.max(mtu - 3, 20); // ATT header overhead, minimum 20
 
     if (data.length <= chunkSize) {
-      // Single write
-      await this._queuedWrite(peerId, data);
+      await this._sendChunk(peerId, peerInfo, data);
       return;
     }
 
     // Chunk data for BLE MTU compliance
     for (let offset = 0; offset < data.length; offset += chunkSize) {
       const chunk = data.subarray(offset, Math.min(offset + chunkSize, data.length));
+      await this._sendChunk(peerId, peerInfo, chunk);
+    }
+  }
+
+  /**
+   * Sends a single chunk using the appropriate role
+   * @param {string} peerId - Target peer ID
+   * @param {any} peerInfo - Peer connection info
+   * @param {Uint8Array} chunk - Data chunk
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _sendChunk(peerId, peerInfo, chunk) {
+    if (peerInfo.role === 'peripheral') {
+      await this._adapter.notifyPeripheralCharacteristic(
+        peerId,
+        BLE_SERVICE_UUID,
+        BLE_CHARACTERISTIC_RX,
+        chunk
+      );
+    } else {
       await this._queuedWrite(peerId, chunk);
     }
   }
@@ -366,7 +461,87 @@ class BLETransport extends Transport {
     const mode = /** @type {any} */ (POWER_MODE)[modeName];
     if (mode) {
       this._powerMode = mode;
+      this._peripheralPower = mode;
     }
+  }
+
+  /**
+   * Starts the BLE peripheral (advertising + GATT server)
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _startPeripheral() {
+    if (!this._adapter || typeof this._adapter.startPeripheral !== 'function') {
+      return;
+    }
+
+    try {
+      const powerMode = this._peripheralPower || POWER_MODE.BALANCED;
+      await this._adapter.startPeripheral({
+        serviceUuid: BLE_SERVICE_UUID,
+        txCharUuid: BLE_CHARACTERISTIC_TX,
+        rxCharUuid: BLE_CHARACTERISTIC_RX,
+        advertiseMode: this._mapPowerModeToAdvertiseMode(powerMode),
+        deviceName: null
+      });
+    } catch (/** @type {any} */ error) {
+      // Peripheral mode is optional: emit warning but keep central scanning alive
+      this.emit('peripheralUnavailable', { reason: error.message });
+    }
+  }
+
+  /**
+   * Maps an internal power mode to the native advertising mode
+   * @param {any} mode - Internal power mode
+   * @returns {string} Native advertising mode
+   * @private
+   */
+  _mapPowerModeToAdvertiseMode(mode) {
+    if (mode === POWER_MODE.PERFORMANCE) {
+      return 'lowLatency';
+    }
+    if (mode === POWER_MODE.POWER_SAVER) {
+      return 'lowPower';
+    }
+    return 'balanced';
+  }
+
+  /**
+   * Registers peripheral-side event listeners
+   * @private
+   */
+  _registerPeripheralListeners() {
+    if (!this._adapter) {
+      return;
+    }
+    const listenerNames = [
+      'onPeripheralCentralConnected',
+      'onPeripheralCentralDisconnected',
+      'onPeripheralWrite',
+      'onPeripheralMtuChanged',
+      'onPeripheralError'
+    ];
+    for (const name of listenerNames) {
+      if (typeof this._adapter[name] === 'function') {
+        const sub = this._adapter[name](this._handlers[name]);
+        if (sub && typeof sub.remove === 'function') {
+          this._peripheralSubscriptions.push(sub);
+        }
+      }
+    }
+  }
+
+  /**
+   * Unregisters peripheral-side event listeners
+   * @private
+   */
+  _unregisterPeripheralListeners() {
+    for (const sub of this._peripheralSubscriptions) {
+      if (sub && typeof sub.remove === 'function') {
+        sub.remove();
+      }
+    }
+    this._peripheralSubscriptions = [];
   }
 
   /**
@@ -394,6 +569,19 @@ class BLETransport extends Transport {
       name: device.name,
       rssi: device.rssi
     });
+
+    if (!this._autoConnect || !this.isRunning || !this.canAcceptPeer()) {
+      return;
+    }
+
+    if (this._peers.has(device.id) || this._pendingConnections.has(device.id)) {
+      return;
+    }
+
+    this._pendingConnections.add(device.id);
+    this.connectToPeer(device.id).catch(() => {
+      this._pendingConnections.delete(device.id);
+    });
   }
 
   /**
@@ -418,6 +606,83 @@ class BLETransport extends Transport {
   }
 
   /**
+   * Handles a central connecting to the peripheral GATT server
+   * @param {string} peerId - Central device ID
+   * @private
+   */
+  _handlePeripheralCentralConnected(peerId) {
+    if (this._peers.has(peerId)) {
+      return;
+    }
+    if (!this.canAcceptPeer()) {
+      return;
+    }
+    this._peers.set(peerId, {
+      peerId,
+      role: 'peripheral',
+      connectedAt: Date.now(),
+      mtu: this._mtu
+    });
+    this.emit('peerConnected', { peerId, rssi: -50 });
+  }
+
+  /**
+   * Handles a central disconnecting from the peripheral GATT server
+   * @param {string} peerId - Central device ID
+   * @private
+   */
+  _handlePeripheralCentralDisconnected(peerId) {
+    this._handleDeviceDisconnected(peerId);
+  }
+
+  /**
+   * Handles an incoming write from a connected central
+   * @param {Object} event - Write event
+   * @param {string} event.deviceId - Source central device ID
+   * @param {Uint8Array} event.data - Received data
+   * @private
+   */
+  _handlePeripheralWrite({ deviceId, data }) {
+    if (!this._peers.has(deviceId)) {
+      // Auto-add if we have room and peer is not in the map
+      if (this.canAcceptPeer()) {
+        this._peers.set(deviceId, {
+          peerId: deviceId,
+          role: 'peripheral',
+          connectedAt: Date.now(),
+          mtu: this._mtu
+        });
+        this.emit('peerConnected', { peerId: deviceId, rssi: -50 });
+      }
+    }
+    this._handleData(deviceId, data);
+  }
+
+  /**
+   * Handles a peripheral-side MTU change
+   * @param {Object} event - MTU change event
+   * @param {string} event.deviceId - Central device ID
+   * @param {number} event.mtu - Negotiated MTU
+   * @private
+   */
+  _handlePeripheralMtuChanged({ deviceId, mtu }) {
+    const peerInfo = this._peers.get(deviceId);
+    if (peerInfo) {
+      peerInfo.mtu = mtu || this._mtu;
+    }
+  }
+
+  /**
+   * Handles peripheral server errors
+   * @param {Object} event - Error event
+   * @param {string} event.message - Error message
+   * @private
+   */
+  _handlePeripheralError(event) {
+    this.emit('peripheralUnavailable', { reason: event.message });
+  }
+
+  /**
    * Handles incoming data from a peer
    * @param {string} peerId - Source peer ID
    * @param {Uint8Array} data - Received data
@@ -436,6 +701,7 @@ class BLETransport extends Transport {
    */
   _createTimeout(ms, message) {
     return new Promise((_, reject) => {
+      // @ts-ignore setTimeout is provided by the JS runtime; @types/node is not installed here
       setTimeout(() => reject(new Error(message)), ms);
     });
   }
