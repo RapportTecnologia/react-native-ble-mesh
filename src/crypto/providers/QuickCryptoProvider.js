@@ -10,10 +10,27 @@
 
 const CryptoProvider = require('../CryptoProvider');
 
+/** Convert a hex string to a Uint8Array */
+function hexToBytes(/** @type {string} */ hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+/** Concatenate two Uint8Arrays */
+function concatBytes(/** @type {Uint8Array} */ a, /** @type {Uint8Array} */ b) {
+  const result = new Uint8Array(a.length + b.length);
+  result.set(a, 0);
+  result.set(b, a.length);
+  return result;
+}
+
 /** DER header for PKCS8 private key wrapping (X25519) */
-const PKCS8_HEADER = Buffer.from('302e020100300506032b656e04220420', 'hex');
+const PKCS8_HEADER = hexToBytes('302e020100300506032b656e04220420');
 /** DER header for SPKI public key wrapping (X25519) */
-const SPKI_HEADER = Buffer.from('302a300506032b656e032100', 'hex');
+const SPKI_HEADER = hexToBytes('302a300506032b656e032100');
 
 /**
  * Crypto provider using react-native-quick-crypto.
@@ -63,18 +80,12 @@ class QuickCryptoProvider extends CryptoProvider {
   sharedSecret(/** @type {any} */ secretKey, /** @type {any} */ publicKey) {
     const crypto = this._getCrypto();
     const privKey = crypto.createPrivateKey({
-      key: Buffer.concat([
-        PKCS8_HEADER,
-        Buffer.from(secretKey)
-      ]),
+      key: concatBytes(PKCS8_HEADER, new Uint8Array(secretKey)),
       format: 'der',
       type: 'pkcs8'
     });
     const pubKey = crypto.createPublicKey({
-      key: Buffer.concat([
-        SPKI_HEADER,
-        Buffer.from(publicKey)
-      ]),
+      key: concatBytes(SPKI_HEADER, new Uint8Array(publicKey)),
       format: 'der',
       type: 'spki'
     });
