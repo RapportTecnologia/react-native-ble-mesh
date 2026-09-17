@@ -91,11 +91,17 @@ describe('WiFiDirectTransport', () => {
   });
 
   describe('send()', () => {
-    it('sends data to connected peer', async () => {
-      await transport.start();
-      await transport.connectToPeer('peer-1');
-      await transport.send('peer-1', new Uint8Array([1, 2, 3]));
-      expect(mockP2p.sendMessageTo).toHaveBeenCalled();
+    it('sends data to connected peer without a global Buffer', async () => {
+      const originalBuffer = global.Buffer;
+      try {
+        global.Buffer = undefined;
+        await transport.start();
+        await transport.connectToPeer('peer-1');
+        await transport.send('peer-1', new Uint8Array([1, 2, 3]));
+        expect(mockP2p.sendMessageTo).toHaveBeenCalledWith('192.168.49.1', 8988, 'AQID');
+      } finally {
+        global.Buffer = originalBuffer;
+      }
     });
 
     it('throws for unconnected peer', async () => {

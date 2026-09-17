@@ -3,6 +3,14 @@
  * Runs before each test file
  */
 
+// Polyfill crypto.getRandomValues for react-native-get-random-values in Node tests
+const { webcrypto } = require('crypto');
+if (!global.crypto) {
+  global.crypto = webcrypto;
+} else if (!global.crypto.getRandomValues) {
+  global.crypto.getRandomValues = webcrypto.getRandomValues.bind(webcrypto);
+}
+
 // Increase timeout for crypto operations
 jest.setTimeout(10000);
 

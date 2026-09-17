@@ -4,6 +4,20 @@ const CryptoProvider = require('../../src/crypto/CryptoProvider');
 const TweetNaClProvider = require('../../src/crypto/providers/TweetNaClProvider');
 const { createProvider } = require('../../src/crypto/AutoCrypto');
 
+describe('React Native compatibility', () => {
+  it('loads QuickCryptoProvider without a global Buffer', () => {
+    const originalBuffer = global.Buffer;
+    try {
+      global.Buffer = undefined;
+      jest.isolateModules(() => {
+        expect(() => require('../../src/crypto/providers/QuickCryptoProvider')).not.toThrow();
+      });
+    } finally {
+      global.Buffer = originalBuffer;
+    }
+  });
+});
+
 describe('CryptoProvider (abstract)', () => {
   it('throws on all abstract methods', () => {
     const p = new CryptoProvider();
